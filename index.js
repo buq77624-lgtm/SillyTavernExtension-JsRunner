@@ -434,12 +434,23 @@ function runnerForceSave() {
 // 把渲染循环没带到、以及启动太早失败的脚本补跑一遍（只跑没成功的，不会重复注册）
 async function runnerSweep() {
   const list = ((extension_settings || {})[extensionName] || {}).javascripts || [];
-  const orphan = $('<div class="runner-script_block"></div>');
+  const pending = list.filter(item => item && item.enabled && item.javascript &&
+    !runnerRanOk.has(runnerKey(item.name, item.javascript)));
+  if (!pending.length) return 0;
+
+  // 先借一次真正的渲染，被救回来的脚本才能拿到自己的 blockHtml（extensions.setting() 要往齿轮上绑）
+  try { await loadSettings(); } catch (e) { console.error(e); }
+
   let fixed = 0;
-  for (const item of list) {
-    if (!item || !item.enabled || !item.javascript) continue;
+  const done = new Set();
+  for (const item of pending) {
     const key = runnerKey(item.name, item.javascript);
-    if (runnerRanOk.has(key)) continue;
+    if (runnerRanOk.has(key)) {
+      if (!done.has(key)) { done.add(key); fixed++; }
+      continue;
+    }
+    // 上面那趟还是没带上它（多半是渲染中途抛错），退化成游离节点补跑
+    const orphan = $('<div class="runner-script_block"></div>');
     if (await runnerEvalOnce(orphan, item.name, item.javascript, true)) {
       runnerRanOk.add(key);
       fixed++;
