@@ -346,6 +346,126 @@ async function initCodeEditor(language = "javascript", theme = "tomorrow_night")
   });
 }
 
+// ===================== 重启后脚本失效的修复（新增，上方原有逻辑未改动）=====================
+// 关掉酒馆再进来，脚本改写出请求的钩子没注册上 -> penalty 原样发出 -> API 报 400，
+// 手工把开关拨一下才恢复。能造成这个现象的三处一起兜：
+//   1) 存盘走 debounce，改完立刻关窗口就来不及写盘；
+//   2) 启动那趟渲染循环中途抛错，排在后面的脚本连执行的机会都没有；
+//   3) 扩展加载早于酒馆初始化，脚本注册事件时它依赖的东西还没就绪。
+
+const runnerRanOk = new Set();
+
+function runnerHash(text) {
+  let h = 2166136261;
+  const s = String(text);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h.toString(36);
+}
+
+function runnerKey(name, javascript) {
+  return String(name) + '::' + runnerHash(javascript);
+}
+
+function runnerIsReady() {
+  return document.readyState === 'complete';
+}
+
+// 与原来 javascriptEval 里那两份构造保持一字不差，只是抽出来好复用
+function runnerBuildExtensions(blockHtml) {
+  const setting = () => {
+    blockHtml.find('.setting_button').removeClass('disabled');
+    return {
+      on: (functionCall) => {
+        blockHtml.find('.setting_button').on('click', functionCall);
+      }
+    };
+  };
+  return {
+    getContext, toastr, doExtrasFetch, getApiUrl, debounce, delay, setting, initCodeEditor, initJsonEditor,
+    writeExtensionField, playMessageSound,
+  };
+}
+
+function runnerBuildCommand() {
+  return {
+    ARGUMENT_TYPE,
+    SlashCommandParser, SlashCommandScope,
+    SlashCommandArgument, SlashCommandNamedArgument, SlashCommand,
+    ...commands,
+  };
+}
+
+// 成没成功要能知道，所以不复用上面那个把异常吞掉的 javascriptEval；quiet 时不再弹第二条 toast
+async function runnerEvalOnce(blockHtml, name, javascript, quiet) {
+  try {
+    Function("script, extensions, command", `with(script, extensions, command) { ${javascript} }`)
+      .bind(window)(script, runnerBuildExtensions(blockHtml), runnerBuildCommand());
+    return true;
+  } catch (e) {
+    console.error(e);
+    if (!quiet) toastr.error(`exec "${name}" error! check the exception information on the console.`);
+    return false;
+  }
+}
+
+// 覆盖同名原函数：同一份正文一次会话只许执行一遍，避免事件重复注册
+javascriptEval = async function (blockHtml, name, javascript) {
+  const key = runnerKey(name, javascript);
+  if (runnerRanOk.has(key)) return false;
+  if (await runnerEvalOnce(blockHtml, name, javascript)) {
+    runnerRanOk.add(key);
+    return true;
+  }
+  return false;
+};
+
+function runnerForceSave() {
+  try {
+    if (typeof script.saveSettings === 'function') script.saveSettings();
+    else script.saveSettingsDebounced();
+  } catch (e) {
+    console.error('[JsRunner] force save failed', e);
+  }
+}
+
+// 把渲染循环没带到、以及启动太早失败的脚本补跑一遍（只跑没成功的，不会重复注册）
+async function runnerSweep() {
+  const list = ((extension_settings || {})[extensionName] || {}).javascripts || [];
+  const orphan = $('<div class="runner-script_block"></div>');
+  let fixed = 0;
+  for (const item of list) {
+    if (!item || !item.enabled || !item.javascript) continue;
+    const key = runnerKey(item.name, item.javascript);
+    if (runnerRanOk.has(key)) continue;
+    if (await runnerEvalOnce(orphan, item.name, item.javascript, true)) {
+      runnerRanOk.add(key);
+      fixed++;
+    }
+  }
+  if (fixed) console.info('[JsRunner] 补执行了 ' + fixed + ' 条脚本');
+  return fixed;
+}
+
+function runnerInstall() {
+  window.addEventListener('pagehide', runnerForceSave);
+  window.addEventListener('beforeunload', runnerForceSave);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') runnerForceSave();
+  });
+
+  // 有限三次，跑完就停；成功的会被 runnerRanOk 挡住，不会叠加
+  const later = () => [0, 1500, 5000].forEach(ms =>
+    setTimeout(() => runnerSweep().catch(e => console.error(e)), ms));
+  if (runnerIsReady()) later();
+  else window.addEventListener('load', later, { once: true });
+}
+
+runnerInstall();
+// ===============================================================================
+
 // This function is called when the extension is loaded
 jQuery(async () => {
   // This is an example of loading HTML from a file
