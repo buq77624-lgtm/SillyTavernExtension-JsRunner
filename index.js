@@ -131,6 +131,134 @@ async function onEditButtonClick(index, data) {
   codeEditor();
 }
 
+// ===================== 文件导入（新增功能，上方原有逻辑未改动）=====================
+// 原来只有 add -> 手动粘贴，几百行的脚本贴进去容易截断然后爆红。
+// 这里允许直接选文件：.txt / .js 整个文件作为一条脚本；.json 按下面的几种形状解析。
+
+const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+
+function importFileStem(name) {
+  const base = String(name).replace(/^.*[\\/]/, "");
+  return base.replace(/\.[^.]+$/, "") || base;
+}
+
+function importCountLines(text) {
+  return text ? text.split("\n").length : 0;
+}
+
+function importUniqueName(list, wanted) {
+  const taken = new Set(list.filter(x => x && typeof x === "object").map(x => String(x.name ?? "")));
+  if (!taken.has(wanted)) return wanted;
+  let n = 2;
+  while (taken.has(`${wanted} (${n})`)) n++;
+  return `${wanted} (${n})`;
+}
+
+// 认这四种：[{name,javascript}]、{javascripts:[...]}、{name,javascript}、["源码", ...]
+function importPickFromJson(data) {
+  const usable = [];
+  const push = (item, fallbackName) => {
+    if (item && typeof item === "object" && typeof item.javascript === "string") {
+      usable.push({
+        name: String(item.name ?? fallbackName ?? ""),
+        javascript: item.javascript,
+        enabled: item.enabled !== false,
+      });
+    } else if (typeof item === "string" && item.trim()) {
+      usable.push({ name: String(fallbackName ?? ""), javascript: item, enabled: true });
+    }
+  };
+
+  if (Array.isArray(data)) {
+    data.forEach(item => push(item));
+    return usable;
+  }
+  if (data && typeof data === "object") {
+    if (Array.isArray(data.javascripts)) {
+      data.javascripts.forEach(item => push(item));
+      return usable;
+    }
+    push(data);
+    return usable;
+  }
+  return usable;
+}
+
+function importEntriesFromFile(fileName, text) {
+  const ext = (String(fileName).match(/\.([^.]+)$/)?.[1] || "").toLowerCase();
+  const stem = importFileStem(fileName);
+
+  if (!text.trim()) return { error: "文件内容为空" };
+
+  if (ext === "json") {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      return { error: `JSON 解析失败：${e.message}` };
+    }
+    const picked = importPickFromJson(parsed);
+    if (!picked.length) {
+      return { error: "不是可识别的脚本 JSON（需要 javascript 或 javascripts 字段）" };
+    }
+    return { entries: picked.map(p => ({ ...p, name: p.name || stem })) };
+  }
+
+  return { entries: [{ name: stem, javascript: text, enabled: true }] };
+}
+
+async function onImportFilesChosen(event) {
+  const files = Array.from(event.target.files || []);
+  // 先清空，保证连续选同一个文件也能再次触发 change
+  event.target.value = "";
+  if (!files.length) return;
+
+  extension_settings[extensionName].javascripts = extension_settings[extensionName].javascripts || [];
+  const list = extension_settings[extensionName].javascripts;
+
+  const done = [];
+  const skipped = [];
+
+  for (const file of files) {
+    if (file.size > IMPORT_MAX_BYTES) {
+      skipped.push(`${file.name}：${(file.size / 1024 / 1024).toFixed(1)}MB 超过 5MB 上限`);
+      continue;
+    }
+
+    let text;
+    try {
+      text = await file.text();
+    } catch (e) {
+      skipped.push(`${file.name}：读取失败 ${e.message}`);
+      continue;
+    }
+
+    const result = importEntriesFromFile(file.name, text);
+    if (result.error) {
+      skipped.push(`${file.name}：${result.error}`);
+      continue;
+    }
+
+    for (const entry of result.entries) {
+      const name = importUniqueName(list, entry.name || "未命名脚本");
+      list.push({ enabled: entry.enabled !== false, name, javascript: entry.javascript });
+      done.push(`${name}（${file.size} 字节 / ${importCountLines(text)} 行）`);
+    }
+  }
+
+  if (done.length) {
+    script.saveSettingsDebounced();
+    // 与 add 保存后的行为一致：启用状态的脚本会立即执行
+    await loadSettings();
+    toastr.success(`已导入 ${done.length} 条：${done.join("、")}`);
+  }
+  if (skipped.length) {
+    toastr.error(`${skipped.length} 个文件未导入：${skipped.join("；")}`);
+  }
+  console.info("[JsRunner] 导入成功:", done, "未导入:", skipped);
+}
+// ===============================================================================
+
 async function javascriptEval(blockHtml, name, javascript) {
     const setting = () => {
       blockHtml.find('.setting_button').removeClass('disabled')
@@ -230,6 +358,10 @@ jQuery(async () => {
 
   // These are examples of listening for events
   $("#add_button").on("click", onAddButtonClick);
+
+  // 文件导入：按钮触发隐藏的文件选择框，选完交给 onImportFilesChosen
+  $("#import_button").on("click", () => $("#runner_import_input").trigger("click"));
+  $("#runner_import_input").on("change", onImportFilesChosen);
 
   // Load settings when starting things up (if you have any)
   loadSettings();
